@@ -20,7 +20,8 @@ def discover(folder):
 
 
 def process(graph, path, approve_all=False):
-    digest = sha256(str(path.resolve()).encode() + b"\0" + path.read_bytes()).hexdigest()
+    # Regenerate with the current extraction and layout after the format upgrade.
+    digest = sha256(b"coforge-v3\0" + str(path.resolve()).encode() + b"\0" + path.read_bytes()).hexdigest()
     config = {"configurable": {"thread_id": digest}}
     snapshot = graph.get_state(config)
     if snapshot.interrupts:

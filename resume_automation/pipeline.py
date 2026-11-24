@@ -7,8 +7,9 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 
-from .extraction import extract_source, load_source_with_docling
+from .extraction import extract_source, load_source_with_docling, project_blocks
 from .paths import MASTER_TEMPLATE, OUTPUT_DIR
+from .presentation import display_text, private_names
 from .schema import CoforgeResumeSchema
 from .template_engine import populate_coforge_document
 
@@ -26,13 +27,17 @@ def verify(data: CoforgeResumeSchema, source):
     if data.confidence_score < 0.90:
         issues.append(f"Low extraction confidence ({data.confidence_score}).")
     issues.extend(f"Reported missing: {item}" for item in data.missing_sections)
-    text = " ".join(source.text.split())
+    def quote_text(value):
+        # Docling and the native text layer may encode the same date separator differently.
+        return " ".join(value.replace("–", "-").replace("—", "-").split())
+
+    text = quote_text(source.text) + "\n" + quote_text(source.pdf_text)
 
     def check(label, values, evidence=text):
         if not values:
             issues.append(f"Missing {label}.")
         for value in values:
-            quote = " ".join(value.split())
+            quote = quote_text(value)
             if not quote or not re.search(r"(?<!\w)" + re.escape(quote) + r"(?!\w)", evidence):
                 issues.append(f"Inspect {label}: {value!r}.")
 
@@ -48,21 +53,15 @@ def verify(data: CoforgeResumeSchema, source):
         check(f"skills in {category}", items)
     if not data.projects:
         issues.append("Zero project history detected.")
-    # Find unique project headings before checking project-specific quotes.
-    starts = []
-    for project in data.projects:
-        anchors = [" ".join(a.split()) for a in (project.project_title, project.organization_name)]
-        positions = [text.index(a) for a in anchors if a and text.count(a) == 1]
-        starts.append(min(positions) if positions else None)
-    for i, project in enumerate(data.projects):
+    for i, (project, markdown, native) in enumerate(zip(
+        data.projects, project_blocks(data.projects, source.text), project_blocks(data.projects, source.pdf_text)
+    )):
         label = f"project {i + 1}"
-        start = starts[i]
-        evidence = text
-        if start is None or starts.count(start) > 1:
+        if project.descriptive_title:
+            issues.append(f"Confirm descriptive title for {label}: {project.project_title!r}.")
+        evidence = quote_text(markdown) + "\n" + quote_text(native)
+        if not evidence.strip():
             issues.append(f"Verify which source block belongs to {label}.")
-        else:
-            end = min((s for s in starts if s is not None and s > start), default=len(text))
-            evidence = text[start:end]
         for field in ("organization_name", "project_title", "role", "duration", "description"):
             check(f"{label} {field}", [getattr(project, field)], evidence)
         check(f"{label} responsibilities", project.responsibilities, evidence)
@@ -93,7 +92,8 @@ def build_graph(checkpointer=None, template_path=MASTER_TEMPLATE,
 
     def generate(state, config):
         data = CoforgeResumeSchema.model_validate(state["extracted_data"])
-        role = next((p.role for p in data.projects if p.role), "")
+        names = private_names(data)
+        role = next(filter(None, (display_text(p.role, names, role=True) for p in data.projects)), "")
         filename = " - ".join(filter(None, (_filename_part(role), _filename_part(data.full_name),
                                              "Coforge_Generated.docx")))
         key = sha256(config["configurable"]["thread_id"].encode()).hexdigest()[:16]

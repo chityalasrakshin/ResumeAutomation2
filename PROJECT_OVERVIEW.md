@@ -1,165 +1,48 @@
-# ResumeAutomation2 - Architecture & Technical Overview
+# ResumeAutomation2 project overview
 
-## 1. Executive Summary & Purpose
+ResumeAutomation2 converts PDF, DOCX and image resumes into the Word layout defined in `templates/Role - Name - Coforge.docx`. The sample input/output pairs in `data/reference_samples` serve as formatting references. The batch reads candidate files directly from `Inputs`.
 
-### The Problem
-In enterprise IT consulting and staffing (specifically Coforge), resumes arrive from candidates in wildly varied formats: PDFs, DOCX, scanned images, different fonts, multi-column tables, and non-standard section headers. Submitting candidates to enterprise clients requires a **standardized, brand-compliant Word format** (`templates/Role - Name - Coforge.docx`).
+## Processing flow
 
-Manual reformatting is slow, labor-intensive, error-prone, and often leads to dropped project details, altered dates, or broken Word layout structures.
+1. **Read the source.** Docling converts each input to Markdown. For PDFs, pypdfium2 also reads the native text layer, which can retain dates that disappear from multi-column Markdown. Partial conversions and embedded Word graphics can trigger review.
+2. **Extract the resume.** The Coforge AI Studio gateway receives the source text and a JSON schema. Pydantic validates the response. The payload retains source durations, organization names, private names, roles, project titles, descriptions and responsibilities. Private names include identified employers, clients and engagement industry labels.
+3. **Check the evidence.** The pipeline checks extracted values against the source and uses organization and project-title anchors to locate the corresponding engagement in each reading. Recovery can fill missing metadata from a project block when it finds an unambiguous candidate. Missing fields, uncertain matches, descriptive project captions and confidence below 0.90 are reasons for review.
+4. **Route the result.** LangGraph sends a verified payload to generation. A flagged payload pauses with a thread ID. An operator can approve or correct it, or run the batch with `--approve-all` to accept flagged payloads as extracted. Parsing or API failures are reported per file.
+5. **Generate the DOCX.** The renderer fills the master template and clones its project table for each engagement. It saves a temporary file in the destination folder and replaces the final file after the save succeeds.
 
-### The Solution
-**ResumeAutomation2** is an enterprise-grade automated resume ingestion, extraction, verification, human-in-the-loop review, and document generation pipeline.
+## Word output
 
-Key architectural pillars:
-- **Docling**: Multi-modal document parser (PDF, DOCX, images $\rightarrow$ structured Markdown).
-- **Coforge AI Studio LLM Router API (`gpt-5-2`)**: Zero-shot, schema-constrained structured entity extraction.
-- **Pydantic v2**: Strict structural schema validation and JSON Schema enforcement.
-- **Lexical Anti-Hallucination Engine**: Verifies extracted information verbatim against the original document.
-- **LangGraph + SQLite Checkpointing**: State-machine orchestration, failure recovery, idempotency, and Human-in-the-Loop (HITL) review.
-- **Low-level OpenXML Engine (`python-docx` + `lxml`)**: Direct XML DOM cloning of Word tables for pixel-perfect document rendering.
+| Section | Display |
+| --- | --- |
+| Profile summary | Aptos 12 pt in the supplied template, with Word bullets for summary statements. |
+| Technical skills | Bold category headings and individual skill bullets in Cambria 12 pt. |
+| Project heading and Role row | Job designation. Identified employer, client and engagement industry names are filtered during rendering. The filename also uses the cleaned role. |
+| Description and responsibilities | A compact description in Cambria 11 pt and a list of responsibility bullets. |
+| Project title | The source title when available. A descriptive caption drawn from the engagement is flagged for confirmation. |
+| Duration | Recognized month/year ranges use full English month names and an en dash. For example, `03/2016 – 09/2017` becomes `March 2016 – September 2017`. Open-ended ranges can end in `Present`. Year-only dates retain year precision. |
 
----
+## Batch operation and checkpoints
 
-## 2. High-Level Architecture & Pipeline Flow
+From the project root, run `.\.venv\Scripts\python.exe .\batch_run.py --approve-all` for unattended generation of all supported inputs. Omit `--approve-all` to review flagged resumes individually. The default worker count is three. The full setup and review commands are in the [README](README.md).
 
-The workflow is orchestrated via a deterministic **LangGraph `StateGraph`**:
+LangGraph persists each resume's state in `output/checkpoints.sqlite`. The thread ID incorporates the processing version, absolute source path and file contents. Each generated document goes into its own hash-named subfolder under `output`. The CLI reports the full path.
 
-```mermaid
-flowchart TD
-    START([START]) --> EXTRACT[Node 1: Extract<br/>• Convert input to Markdown via Docling<br/>• Call Coforge AI Studio LLM Router<br/>• Validate against Pydantic schema<br/>• Run lexical verification against source]
-    
-    EXTRACT --> VERIFY[Node 2: Verify<br/>• Check flagged issues count<br/>• Set validation_passed flag]
-    
-    VERIFY --> COND{validation_passed?}
-    
-    COND -- "True (Zero issues & confidence >= 0.90)" --> GENERATE[Node 3: Generate<br/>• Clone XML tables from master template<br/>• Populate candidate data & projects<br/>• Save standardized Coforge DOCX]
-    
-    COND -- "False (Discrepancies / Low confidence)" --> REVIEW[Node 4: Review (HITL Interrupt)<br/>• Trigger LangGraph interrupt()<br/>• Save frozen state to SQLite<br/>• Await operator approval / JSON edit]
-    
-    REVIEW -- "Manual Approval / Corrected JSON" --> GENERATE
-    
-    GENERATE --> END_NODE([END])
-```
+| State at the next run | Behavior |
+| --- | --- |
+| Empty output directory | Creates a checkpoint database and extracts each input from scratch. |
+| Completed checkpoint and generated DOCX | Returns the existing document path. |
+| Completed checkpoint and missing DOCX | Renders the document from the saved payload. |
+| Pending review | Reports the thread ID or resumes with approval when using `--approve-all`. |
 
----
+## Implementation map
 
-## 3. How LangGraph is Used
-
-LangGraph acts as a stateful, fault-tolerant workflow orchestrator:
-
-### A. Pipeline State (`OrchestrationState`)
-The pipeline operates on a typed state object defined via Python's `TypedDict`:
-```python
-class OrchestrationState(TypedDict, total=False):
-    file_path: str            # Absolute path to source resume
-    extracted_data: dict      # Serialized Pydantic resume schema
-    flagged_issues: list[str] # Discrepancies detected by lexical verification
-    validation_passed: bool   # Routing condition (True -> Generate, False -> Review)
-    output_docx_path: str     # Path to generated standardized DOCX
-```
-
-### B. Persistent SQLite Checkpointing (`SqliteSaver`)
-- Every execution is persisted into `output/checkpoints.sqlite`.
-- **Deterministic Thread IDs**: For every resume, an execution thread ID is generated via a SHA-256 hash:
-  $$\text{Thread ID} = \text{SHA-256}(\text{path} + \text{raw\_file\_bytes})$$
-- **Idempotency**: If a resume has already been processed and its target output exists, the pipeline returns the existing file immediately without re-calling the LLM.
-- **Resilience**: If processing is interrupted or crashes mid-batch, the state graph resumes cleanly from the last completed node.
-
-### C. Human-in-the-Loop (HITL) Interrupts
-- When discrepancies or low confidence are detected, the graph routes to the `review` node and executes LangGraph's native `interrupt()` function:
-  ```python
-  decision = interrupt({
-      "file": state["file_path"],
-      "issues": state["flagged_issues"],
-      "payload": state["extracted_data"]
-  })
-  ```
-- This freezes execution and leaves the resume in a review state (`Review <THREAD_ID>`).
-- Operators can inspect pending issues via the CLI (`--show <THREAD_ID>`) and resume execution by approving or submitting a corrected JSON payload (`--approve <THREAD_ID> --corrected <file.json>`).
-- If batch processing should bypass manual pauses, the `--approve-all` flag auto-approves all extractions.
-
----
-
-## 4. API & Model Specifications
-
-- **Gateway**: Coforge AI Studio LLM Router
-- **Endpoint**: `https://quasarmarket.coforge.com/qag/llmrouter-api/v2/chat/completions`
-- **Protocol**: OpenAI-compatible REST API (`POST`)
-- **Authentication**: Custom HTTP header `X-API-KEY: <API_KEY>`
-- **Model**: `gpt-5-2` (configurable via `MODEL_NAME` in `.env`)
-- **Inference Hyperparameters**:
-  - `temperature = 0.0` (zero variance; strictly deterministic extraction)
-  - `top_p = 1.0`
-  - `max_tokens = 4000`
-- **Custom Client Implementation**: Wrapped in a custom LangChain `LLM` subclass (`CustomLLM` in `resume_automation/extraction.py`), with dedicated timeout management, error handling, and completion-stop verification.
-
----
-
-## 5. Detailed Component Breakdown
-
-### 1. Multi-Modal Document Parsing (`extraction.py`)
-- Uses IBM's `docling` library (`DocumentConverter`) to parse multi-page PDFs, Word documents (`.docx`), and scanned images into unified, clean Markdown.
-- Preserves structure, tables, and bullet point relationships.
-- Uses a thread mutex (`_conversion_lock`) to allow safe sharing of local parsing models across concurrent threads.
-- Inspects Word drawing XML elements (`w:drawing`, `w:pict`) via XPath to flag text hidden in canvas graphics.
-
-### 2. Schema Enforcement (`schema.py`)
-- Implemented with Pydantic v2: `CoforgeResumeSchema` and `ProjectBlock`.
-- Enforces `extra="forbid"`, `strict=True`, and `allow_inf_nan=False`.
-- The Pydantic model is compiled into standard JSON Schema (`model_json_schema()`) and injected into the system prompt to guarantee valid structure.
-- Fields:
-  - `full_name`, `email`, `phone`
-  - `profile_summary` (`list[str]`)
-  - `technical_skills` (`dict[str, list[str]]`)
-  - `certifications` (`list[str]`)
-  - `projects` (`list[ProjectBlock]` with company, title, role, duration, description, and responsibilities)
-  - `missing_sections` (`list[str]`)
-  - `confidence_score` (`float` between 0.0 and 1.0)
-
-### 3. Lexical Anti-Hallucination Verification (`pipeline.py`)
-Rather than blindly accepting the LLM output, a deterministic validation algorithm runs against the source text:
-- **Confidence Gate**: Checks `confidence_score >= 0.90`.
-- **Verbatim Entity Checks**: Verifies that candidate name, phone, email, summary bullets, and skill tags exist as substring matches in the source text.
-- **Project Boundary Anchoring**:
-  - Slices the source text into distinct project ranges: `text[start_index:end_index]` based on company and project headings.
-  - Verifies that project roles, durations, and responsibilities exist strictly within their respective source sections, preventing the LLM from mixing up or blending details across different employers.
-
-### 4. OpenXML DOM Template Engine (`template_engine.py`)
-- Standard text replacement breaks Word table layouts and styles. Instead, this engine directly manipulates the OpenXML DOM using `python-docx` and `lxml`.
-- Reads `templates/Role - Name - Coforge.docx`.
-- Populates profile summary bullets and categorized technical skills.
-- **Dynamic XML Deep-Copy**:
-  - Clones the master project table (`deepcopy(master._tbl)`) for every project engagement.
-  - Strips Word paragraph IDs (`w14:paraId`, `w14:textId`) to avoid XML collisions.
-  - Populates cells, applies `List Bullet` numbering styles, and removes the original blank template table.
-- **Atomic File Writing**: Saves to a temporary file (`.tmp`) first and performs an atomic replace to eliminate corrupt or partially written documents.
-
-### 5. Multi-Threaded Batch Runner (`cli.py` & `batch_run.py`)
-- Implements `ThreadPoolExecutor` to process dozens of resumes concurrently.
-- Supports configurable concurrency via `--workers <N>` (defaults to 3).
-- Outputs files into deterministic folders named after the thread hash:
-  `output/<thread_hash>/<Role> - <Candidate Name> - Coforge_Generated.docx`
-
----
-
-## 6. Project Directory Reference
-
-| Path | Purpose |
-| :--- | :--- |
-| `batch_run.py` | Top-level CLI entry point. |
-| `resume_automation/cli.py` | Argument parsing, batch worker pool, review and approval subcommands. |
-| `resume_automation/pipeline.py` | LangGraph definition, state schema, lexical verification (`verify`). |
-| `resume_automation/extraction.py` | Docling document converter, custom LangChain LLM, prompt construction. |
-| `resume_automation/schema.py` | Strict Pydantic v2 data models. |
-| `resume_automation/template_engine.py` | OpenXML DOM manipulation for `.docx` generation. |
-| `resume_automation/paths.py` | Centralized project paths (`Inputs/`, `output/`, `templates/`). |
-| `templates/` | Stores the master Coforge Word template. |
-| `Inputs/` | Source resume files. |
-| `output/` | Standardized generated resumes and `checkpoints.sqlite`. |
-| `tests/` | Unit tests for extraction, validation, rendering, and checkpointing. |
-
----
-
-## 7. Quick Talking Points ("Elevator Pitch")
-
-> *"ResumeAutomation2 is an enterprise resume transformation pipeline that standardizes arbitrary candidate resumes into formatted Coforge Word deliverables. It ingests multi-format files using Docling, parses them into strict Pydantic schemas via the Coforge AI Studio API running `gpt-5-2`, and subjects the output to deterministic lexical verification to prevent hallucinations. The entire lifecycle is choreographed using a LangGraph state machine backed by SQLite checkpoints, providing automatic idempotency, failure recovery, and human-in-the-loop review for flagged resumes before programmatically rendering the final output using direct OpenXML table cloning."*
+| Path | Responsibility |
+| --- | --- |
+| `batch_run.py`, `resume_automation/cli.py` | CLI entry point, input discovery, concurrency and checkpoint operations. |
+| `resume_automation/extraction.py` | Docling conversion, PDF text layer, gateway requests and project metadata recovery. |
+| `resume_automation/schema.py` | Strict Pydantic models for the candidate and project payloads. |
+| `resume_automation/pipeline.py` | Source checks, review routing and generation. |
+| `resume_automation/presentation.py` | Display dates, role cleanup and private-name filtering. |
+| `resume_automation/template_engine.py` | Word table cloning, field placement and native list formatting. |
+| `resume_automation/paths.py` | Default input, output and template paths. |
+| `tests/test_pipeline.py` | Regression coverage for rendering, project metadata, gateway handling and batch review. |

@@ -21,10 +21,10 @@ from resume_automation.template_engine import populate_coforge_document
 
 
 def payload():
-    projects = [dict(organization_name=f"Org {i}", project_title=f"Project {i}",
+    projects = [dict(organization_name=f"Org {i}", project_title=f"Project {i}", descriptive_title=False,
                      role="Engineer", duration=f"January 202{i}", description="Reviewed data.",
                      responsibilities=["Checked records."]) for i in (3, 2, 1)]
-    return dict(full_name="Test Candidate", email="candidate@example.org", phone="555-0102", profile_summary=["Builds tools."],
+    return dict(full_name="Test Candidate", private_names=[], email="candidate@example.org", phone="555-0102", profile_summary=["Builds tools."],
                 technical_skills={"Languages": ["Python"]}, certifications=["Certificate A"],
                 projects=projects, missing_sections=[], confidence_score=0.9)
 
@@ -39,7 +39,7 @@ class PipelineTests(unittest.TestCase):
         doc = Document()
         doc.add_paragraph("Test Candidate\ncandidate@example.org\n555-0102\nBuilds tools.\nPython\nCertificate A")
         for project in self.data["projects"]:
-            for value in project.values():
+            for value in (v for v in project.values() if isinstance(v, (str, list))):
                 doc.add_paragraph(value if isinstance(value, str) else value[0])
         doc.save(self.source)
         converter_patch = patch("resume_automation.extraction.get_converter")
@@ -62,13 +62,58 @@ class PipelineTests(unittest.TestCase):
                          [("Languages", True), ("Python", False)])
         master = Document(MASTER).tables[3]
         for i, tbl in enumerate(doc.tables[3:]):
-            self.assertTrue(tbl.cell(0, 0).text.endswith(self.data["projects"][i]["organization_name"]))
-            self.assertEqual(tbl.rows[4].cells[-1].paragraphs[0].style.name, "List Bullet")
+            self.assertEqual(tbl.cell(0, 0).text, "Engineer")
+            self.assertEqual(tbl.rows[4].cells[-1].paragraphs[0].style.name, "List Paragraph")
             for xpath in ("./w:tblPr", "./w:tblGrid", "./w:tr/w:tc/w:tcPr"):
                 self.assertEqual([etree.tostring(e) for e in tbl._tbl.xpath(xpath)],
                                  [etree.tostring(e) for e in master._tbl.xpath(xpath)])
         self.assertEqual(doc.tables[4].rows[2].cells[1].text, "")
         self.assertEqual(doc.tables[4].rows[2].cells[-1].text, "Project 2")
+
+    def test_role_only_and_display_dates(self):
+        self.data["private_names"] = ["Banking"]
+        self.data["projects"][0].update(role="Developer, HSN Tech Solutions", duration="03/2016 – 09/2017",
+                                        description="Delivered reports for Org 3 in Banking.")
+        self.data["projects"][1].update(role="Consultant | Banking", duration="Sept. 2021 to current")
+        self.data["projects"][2].update(duration="2019-2021")
+        doc = Document(populate_coforge_document(self.data, MASTER, self.folder / "roles.docx"))
+        for table, role, dates in zip(doc.tables[3:], ["Developer", "Consultant", "Engineer"],
+                                      ["March 2016 – September 2017", "September 2021 – Present", "2019 – 2021"]):
+            self.assertEqual(table.cell(0, 0).text, role)
+            self.assertEqual(table.rows[3].cells[-1].text, role)
+            self.assertEqual(table.rows[2].cells[1].text, dates)
+        for name in ["Banking", "Org 3", "HSN Tech Solutions"]:
+            self.assertNotIn(name, doc.element.body.xml)
+
+    def test_reference_list_formatting(self):
+        self.data["profile_summary"] = ["Builds tools. Tests APIs."]
+        self.data["technical_skills"] = {"Platforms": ["Sales Cloud, AWS (EC2, S3)"]}
+        doc = Document(populate_coforge_document(self.data, MASTER, self.folder / "lists.docx"))
+        summary = doc.tables[0].cell(1, 0).paragraphs[1:]
+        category, *skills = doc.tables[1].cell(1, 0).paragraphs
+        self.assertEqual([p.text for p in summary], ["Builds tools.", "Tests APIs."])
+        self.assertEqual([p.text for p in skills], ["Sales Cloud", "AWS (EC2, S3)"])
+        self.assertTrue(category.runs[0].bold)
+        self.assertIsNone(category._p.pPr.numPr)
+        for p in [*summary, *skills, doc.tables[3].rows[4].cells[-1].paragraphs[0]]:
+            n = doc.part.numbering_part.element
+            num = n.num_having_numId(p._p.pPr.numPr.numId.val)
+            lvl = f"./w:abstractNum[@w:abstractNumId='{num.abstractNumId.val}']/w:lvl[@w:ilvl='0']"
+            self.assertTrue(n.xpath(lvl + "/w:numFmt[@w:val='bullet']"))
+            self.assertTrue(n.xpath(lvl + "/w:pPr/w:ind[@w:left='720'][@w:hanging='360']"))
+        self.assertEqual(skills[0].runs[0].font.name, "Cambria")
+
+    @patch("resume_automation.extraction.call_coforge_ai_studio")
+    def test_missing_project_metadata_from_pdf_layer(self, gateway):
+        for project in self.data["projects"]:
+            project.update(project_title="", duration="")
+        gateway.return_value = json.dumps(self.data)
+        native = ("Client: Org 1\nProject Title: Migration\n03/2020 – 04/2022\n"
+                  "Client: Org 2\n| Duration | May 2022 - Present | Title | Reporting |\n"
+                  "Client: Org 3\nEducation\n2015 - 2019")
+        recovered = extract_source(SourceDocument("Org 1\nOrg 2\nOrg 3", [], native))
+        self.assertEqual([(p["project_title"], p["duration"]) for p in recovered["projects"]],
+                         [("", ""), ("Reporting", "May 2022 - Present"), ("Migration", "03/2020 – 04/2022")])
 
     def test_automatic_and_repeat(self):
         extractor = Mock(return_value=self.data)

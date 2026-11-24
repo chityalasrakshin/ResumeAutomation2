@@ -8,6 +8,7 @@ class Contract(BaseModel):
 class ProjectBlock(Contract):
     organization_name: str
     project_title: str
+    descriptive_title: bool = Field(default=False, description="True when the title is a descriptive caption rather than an explicit project name")
     role: str
     duration: str = Field(default="", description="Exact project-specific duration, empty if absent")
     description: str
@@ -16,6 +17,7 @@ class ProjectBlock(Contract):
 
 class CoforgeResumeSchema(Contract):
     full_name: str
+    private_names: list[str] = Field(default_factory=list, description="Employer, client and engagement industry labels to omit from the displayed resume, including source aliases")
     email: str | None = None
     phone: str | None = None
     profile_summary: list[str]
