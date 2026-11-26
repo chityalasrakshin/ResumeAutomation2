@@ -4,26 +4,56 @@ from hashlib import sha256
 import json
 from pathlib import Path
 import sys
+from threading import Lock
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command
 
 from .paths import INPUT_DIR, MASTER_TEMPLATE, OUTPUT_DIR
-from .pipeline import build_graph
+from .extraction import load_source_with_docling
+from .coverage import source_coverage
+from .pipeline import build_graph, verify
 from .schema import CoforgeResumeSchema
 
 
 def discover(folder):
     extensions = {".pdf", ".docx", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
+    if folder.is_file():
+        if folder.name.startswith("~$") or folder.suffix.lower() not in extensions:
+            raise ValueError(f"Unsupported resume: {folder.name}. Expected PDF, DOCX or a supported image.")
+        return [folder]
+    if not folder.is_dir():
+        raise ValueError(f"Input file or directory does not exist: {folder}")
     return sorted(p for p in folder.iterdir() if p.is_file() and not p.name.startswith("~$")
                   and p.suffix.lower() in extensions)
 
 
+# Identical files in concurrent batch slots share one checkpoint and output.
+_thread_locks = [Lock() for _ in range(64)]
+
+
 def process(graph, path, approve_all=False):
     # Regenerate with the current extraction and layout after the format upgrade.
-    digest = sha256(b"coforge-v3\0" + str(path.resolve()).encode() + b"\0" + path.read_bytes()).hexdigest()
+    digest = sha256(b"coforge-v4\0" + path.read_bytes()).hexdigest()
+    with _thread_locks[int(digest[:2], 16) % len(_thread_locks)]:
+        return _process_thread(graph, path, approve_all, digest)
+
+
+def _process_thread(graph, path, approve_all, digest):
     config = {"configurable": {"thread_id": digest}}
     snapshot = graph.get_state(config)
+    if snapshot.values.get("extracted_data") and (
+            not snapshot.values.get("overviews_checked") or "coverage_issues" not in snapshot.values):
+        data = CoforgeResumeSchema.model_validate(snapshot.values["extracted_data"])
+        source = load_source_with_docling(path)
+        coverage = source_coverage(data, source, repair=True)
+        updates = {"extracted_data": data.model_dump(), "overviews_checked": True, "coverage_issues": coverage}
+        if coverage or updates["extracted_data"] != snapshot.values["extracted_data"] or snapshot.next:
+            updates["flagged_issues"] = verify(data, source, coverage)
+            graph.update_state(config, updates, as_node="extract")
+        else:
+            graph.update_state(config, {**updates, "validation_passed": True}, as_node="review")
+        snapshot = graph.get_state(config)
     if snapshot.interrupts:
         result = {"__interrupt__": snapshot.interrupts}
     elif snapshot.next:
@@ -37,9 +67,11 @@ def process(graph, path, approve_all=False):
     else:
         result = graph.invoke({"file_path": str(path.resolve())}, config)
     if result.get("__interrupt__"):
-        if not approve_all:
+        if not approve_all or result["__interrupt__"][0].value.get("coverage_issues"):
             return f"Review {digest}"
         result = graph.invoke(Command(resume={"approved": True}), config)
+        if result.get("__interrupt__"):
+            return f"Review {digest}"
     return f"Generated {result['output_docx_path']}"
 
 
@@ -51,7 +83,10 @@ def run_bulk_batch(graph, folder, workers, approve_all=False):
         futures = {pool.submit(process, graph, path, approve_all): path for path in files}
         for future in as_completed(futures):
             try:
-                print(f"{futures[future].name}: {future.result()}")
+                status = future.result()
+                print(f"{futures[future].name}: {status}")
+                if approve_all and status.startswith("Review "):
+                    failures += 1
             except Exception as exc:
                 failures += 1
                 print(f"{futures[future].name}: {type(exc).__name__}: {exc}", file=sys.stderr)
@@ -60,7 +95,7 @@ def run_bulk_batch(graph, folder, workers, approve_all=False):
 
 def main():
     parser = argparse.ArgumentParser(description="Generate or review Coforge resumes")
-    parser.add_argument("--inputs", type=Path, default=INPUT_DIR)
+    parser.add_argument("--inputs", type=Path, default=INPUT_DIR, help="Resume file or directory (default: Inputs)")
     parser.add_argument("--template", type=Path, default=MASTER_TEMPLATE)
     parser.add_argument("--output", type=Path, default=OUTPUT_DIR)
     parser.add_argument("--workers", type=int, default=3)
@@ -68,7 +103,7 @@ def main():
     mode.add_argument("--show", metavar="THREAD_ID")
     mode.add_argument("--approve", metavar="THREAD_ID")
     mode.add_argument("--approve-all", action="store_true",
-                      help="Approve every flagged extraction in this batch as-is and generate Word documents")
+                      help="Approve routine review flags. Detected source omissions require a corrected payload.")
     parser.add_argument("--corrected", type=Path, help="Reviewed resume payload JSON for --approve")
     args = parser.parse_args()
     if args.workers < 1 or (args.corrected and not args.approve):
@@ -78,7 +113,10 @@ def main():
         graph = build_graph(saver, args.template, args.output)
         thread = args.show or args.approve
         if not thread:
-            return run_bulk_batch(graph, args.inputs, args.workers, args.approve_all)
+            try:
+                return run_bulk_batch(graph, args.inputs, args.workers, args.approve_all)
+            except ValueError as exc:
+                parser.error(str(exc))
         config = {"configurable": {"thread_id": thread}}
         pending = graph.get_state(config).interrupts
         if not pending:
@@ -91,6 +129,9 @@ def main():
             decision["corrected_payload"] = CoforgeResumeSchema.model_validate_json(
                 args.corrected.read_text(encoding="utf-8-sig")).model_dump()
         result = graph.invoke(Command(resume=decision), config)
+        if result.get("__interrupt__"):
+            print(json.dumps(result["__interrupt__"][0].value, indent=2))
+            return 1
         print(result["output_docx_path"])
         return 0
 

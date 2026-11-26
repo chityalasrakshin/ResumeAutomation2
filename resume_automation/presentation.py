@@ -43,13 +43,12 @@ def private_names(resume):
 
 
 def display_text(value, names, *, role=False):
-    if not names or not names.search(value):
+    if not role or not names or not names.search(value):
         return value.strip()
     if names.fullmatch(value.strip()):
         return ""
-    if role:
-        value = re.sub(r"\(\s*" + names.pattern + r"\s*\)", "", value, flags=re.I)
-        value = re.sub(r"(?:\s+(?:at|for|in)\s+|\s*[,|@–—-]\s*)" + names.pattern,
-                       "", value, flags=re.I)
-    value = names.sub("" if role else "the organization", value)
+    value = re.sub(r"\(\s*" + names.pattern + r"\s*\)", "", value, flags=re.I)
+    value = re.sub(r"(?:\s+(?:at|for|in)\s+|\s*[,|@–—-]\s*)" + names.pattern,
+                   "", value, flags=re.I)
+    value = names.sub("", value)
     return " ".join(value.split()).strip(" ,|@–—-")
