@@ -1,4 +1,6 @@
-# MISSION BRIEF: Production-Grade Upgrade of ResumeAutomation2
+# Production-grade implementation requirements
+
+This document preserves the implementation requirements used during the initial upgrade. For current setup, commands, package paths, and operating behavior, see the [README](../README.md) and [project overview](project-overview.md).
 
 You are tasked with upgrading the `ResumeAutomation2` repository to a robust, enterprise-grade, and production-ready system. There is zero tolerance for shortcuts, temporary fixes, loose data types, or inconsistent behavior. Every change must be implemented thoroughly, verified against real documents, and backed by comprehensive unit tests without breaking existing strengths.
 
@@ -6,7 +8,7 @@ You are tasked with upgrading the `ResumeAutomation2` repository to a robust, en
 
 ## 1. Context & Architecture Overview
 
-`ResumeAutomation2` standardizes candidate resumes (PDF, DOCX, scanned images) into enterprise Coforge Word documents conforming to `templates/Role - Name - Coforge.docx` (with reference implementations in `data/reference_samples/`).
+`ResumeAutomation2` standardizes candidate resumes (PDF, DOCX, scanned images) into enterprise Coforge Word documents conforming to `templates/coforge/master_template.docx` (with local-only reference implementations in `local_data/reference_samples/`).
 
 ### Tech Stack
 - **Python 3.12** in `.venv`
@@ -51,7 +53,7 @@ You are tasked with upgrading the `ResumeAutomation2` repository to a robust, en
 
 ### B. Output Consistency & Determinism
 - Enforce `temperature=0.0` and `top_p=1.0`.
-- Maintain deterministic SHA-256 thread hashing in `cli.py` (`sha256(b"coforge-v4\0" + file_bytes)`) to guarantee idempotency across re-runs.
+- Maintain deterministic SHA-256 thread hashing in `src/resume_automation/cli.py` (`sha256(b"coforge-v6\0" + file_bytes)`) to guarantee idempotency across re-runs.
 - Repeated executions with the same input document must yield byte-for-byte identical JSON structures and document layouts.
 
 ---
@@ -85,7 +87,7 @@ You are tasked with upgrading the `ResumeAutomation2` repository to a robust, en
   4. Render all categories into Table 1 of the Word template with bold category headers and bulleted items in Cambria 12 pt.
 
 ### Requirement 4: Education Clarification & Handling
-- **Clarification**: The official client-facing template (`templates/Role - Name - Coforge.docx`) and reference deliverables (`Pavan P.docx`, `Sreenivasa G.docx`) contain **only four sections**:
+- **Clarification**: The official client-facing template (`templates/coforge/master_template.docx`) and reference deliverables (`Pavan P.docx`, `Sreenivasa G.docx`) contain **only four sections**:
   1. Profile Summary (Table 0)
   2. Technical Skills (Table 1)
   3. Certifications (Table 2)
@@ -121,7 +123,7 @@ You are tasked with upgrading the `ResumeAutomation2` repository to a robust, en
 ## 4. Master Template & Table 0/3 Header Alignment
 
 ### Critical Table Header Bug in `template_engine.py`
-- Look at `templates/Role - Name - Coforge.docx` Table 3:
+- Look at `templates/coforge/master_template.docx` Table 3:
   - **Row 0**: `Name of the Project/Organization:`
   - **Row 1**: `Description` | `<Project Description>`
   - **Row 2**: `Duration` | `<Duration>` | `Title` | `<Title>`
@@ -134,7 +136,7 @@ You are tasked with upgrading the `ResumeAutomation2` repository to a robust, en
   role = display_text(project.role, names, role=True)
   _write(header, role)  # <--- OVERWROTE "Name of the Project/Organization:" WITH ROLE!
   ```
-- **Correction**: Align with `data/reference_samples/pavan_p/Pavan P.docx`:
+- **Correction**: Align with `local_data/reference_samples/pavan_p/Pavan P.docx`:
   - **Row 0**: Must be: `f"Name of the Project/Organization: {display_org_name}"` (e.g., `Name of the Project/Organization: American Express`).
   - **Row 3**: Must be: `role` (e.g., `Salesforce Data Cloud & Analytics Consultant`).
 
@@ -142,7 +144,7 @@ You are tasked with upgrading the `ResumeAutomation2` repository to a robust, en
 
 ## 5. File-by-File Implementation Plan
 
-### 1. `resume_automation/schema.py`
+### 1. `src/resume_automation/schema.py`
 - Enforce strict Pydantic v2 models compatible with OpenAI Structured Outputs (`model_config = ConfigDict(extra="forbid", strict=True)`).
 - `ProjectBlock`:
   - `organization_name: str`
@@ -156,7 +158,7 @@ You are tasked with upgrading the `ResumeAutomation2` repository to a robust, en
   - Add `education: list[str] = Field(default_factory=list)`
   - Ensure all fields are typed cleanly, nullable fields use `str | None = None`.
 
-### 2. `resume_automation/extraction.py`
+### 2. `src/resume_automation/extraction.py`
 - Update `CustomLLM._call` to pass `response_format={"type": "json_schema", "json_schema": {"name": "CoforgeResumeSchema", "strict": True, "schema": ...}}`.
 - Update `SYSTEM` prompt:
   - Add explicit instructions for:
@@ -166,18 +168,18 @@ You are tasked with upgrading the `ResumeAutomation2` repository to a robust, en
     - Extracting Education into the `education` array.
 - In `recover_project_metadata`: Ensure regex fallback logic does not corrupt valid LLM-extracted titles or empty descriptions.
 
-### 3. `resume_automation/presentation.py`
+### 3. `src/resume_automation/presentation.py`
 - Fix `display_text`:
   - Remove destructive `names.sub("the organization", value)` on responsibilities.
   - Implement clean, grammar-preserving handling for organizations in text.
 - Maintain `display_duration` with full month names (e.g. `March 2016 – September 2017`).
 
-### 4. `resume_automation/template_engine.py`
+### 4. `src/resume_automation/template_engine.py`
 - Correct Table 3 Row 0 to render `Name of the Project/Organization: <Org Name>`.
 - Correct Table 3 Row 1 to leave Description cell completely empty when `project.description == ""`.
 - Ensure Table 1 renders combined and categorized Technical Skills cleanly with bold category headers and bullet points.
 
-### 5. `resume_automation/pipeline.py`
+### 5. `src/resume_automation/pipeline.py`
 - Adjust lexical `verify` function:
   - Allow `description` to be empty string without flagging validation failure.
   - Verify skills against combined technical and key skills in the source text.
@@ -203,9 +205,9 @@ Before reporting completion, execute the following commands in PowerShell from t
    ```
 2. Run a batch test on the real input resumes:
    ```powershell
-   .\.venv\Scripts\python.exe .\batch_run.py --inputs Inputs --output output_test --approve-all
+   .\.venv\Scripts\python.exe -m resume_automation --inputs local_data\incoming --output artifacts_test --approve-all
    ```
-3. Inspect the generated documents in `output_test` using python-docx to verify:
+3. Inspect the generated documents in `artifacts_test` using python-docx to verify:
    - Project descriptions are blank when absent in source.
    - Project titles are properly formatted and not hallucinated.
    - Table 3 Row 0 displays `Name of the Project/Organization:` correctly.

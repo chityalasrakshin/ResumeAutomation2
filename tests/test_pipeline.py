@@ -11,6 +11,7 @@ from unittest.mock import Mock, patch
 from zipfile import ZipFile
 
 from docx import Document
+from huggingface_hub.errors import LocalEntryNotFoundError
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command
 from lxml import etree
@@ -20,6 +21,7 @@ from resume_automation.coverage import source_coverage
 from resume_automation.overviews import sections
 from resume_automation.extraction import SourceDocument, extract_source, load_source_with_docling
 from resume_automation.paths import MASTER_TEMPLATE as MASTER
+from resume_automation.paths import resolve_input_path
 from resume_automation.pipeline import build_graph, verify
 from resume_automation.schema import CoforgeResumeSchema
 from resume_automation.template_engine import populate_coforge_document
@@ -52,6 +54,27 @@ class PipelineTests(unittest.TestCase):
             discover(legacy)
         with self.assertRaisesRegex(ValueError, "does not exist"):
             discover(self.folder / "missing.pdf")
+
+    def test_legacy_inputs_path_redirects_to_local_inbox(self):
+        legacy_dir = self.folder / "Inputs"
+        inbox_dir = self.folder / "local_data" / "incoming"
+        legacy_file = legacy_dir / "resume.pdf"
+        inbox_file = inbox_dir / legacy_file.name
+        legacy_dir.mkdir(parents=True)
+        inbox_dir.mkdir(parents=True)
+        (legacy_dir / "still-open.pdf").touch()
+        inbox_file.touch()
+        with patch("resume_automation.paths.LEGACY_INPUT_DIR", legacy_dir), patch(
+                "resume_automation.paths.INPUT_DIR", inbox_dir), patch(
+                "resume_automation.cli.LEGACY_INPUT_DIR", legacy_dir), patch(
+                "resume_automation.cli.INPUT_DIR", inbox_dir):
+            self.assertEqual(resolve_input_path(legacy_file), inbox_file)
+            self.assertEqual({path.name for path in discover(legacy_dir)}, {
+                "resume.pdf", "still-open.pdf"
+            })
+            self.assertEqual({path.name for path in discover(inbox_dir)}, {
+                "resume.pdf", "still-open.pdf"
+            })
 
     @patch("resume_automation.extraction.call_coforge_ai_studio")
     def test_cli_single_document_goes_to_default_output(self, gateway):
@@ -279,7 +302,7 @@ class PipelineTests(unittest.TestCase):
         graph = build_graph(template_path=MASTER, output_dir=self.folder)
         status = process(graph, self.source)
         self.assertTrue(status.startswith("Generated "), status)
-        self.converter.convert.assert_called_once_with(self.source, raises_on_error=False)
+        self.converter.convert.assert_called_once_with(self.source.resolve(), raises_on_error=False)
         args, kwargs = post.call_args
         self.assertEqual(args[0], os.environ["API_URL"])
         self.assertEqual(kwargs["headers"]["X-API-KEY"], "test-key")
@@ -345,21 +368,85 @@ class PipelineTests(unittest.TestCase):
             with self.subTest(status=status), self.assertRaises(ValueError):
                 load_source_with_docling(self.source)
         post.assert_not_called()
+
+    def test_pdf_uses_native_text_when_docling_model_is_unavailable(self):
+        source_file = self.folder / "input.pdf"
+        source_file.touch()
+        self.converter.convert.side_effect = LocalEntryNotFoundError("Model not cached")
+        page = Mock()
+        page.get_textpage.return_value.get_text_bounded.return_value = (
+            "\uf076 First responsibility wraps\ncontinued here.\n"
+            "\uf0b7 Second responsibility."
+        )
+        with patch("pypdfium2.PdfDocument") as pdf_document:
+            pdf_document.return_value.__enter__.return_value = [page]
+            source = load_source_with_docling(source_file)
+        self.assertEqual(source.text, "")
+        self.assertEqual(
+            source.pdf_text,
+            "• First responsibility wraps continued here.\n• Second responsibility.",
+        )
+        self.assertTrue(any("extracted the PDF text locally" in warning for warning in source.warnings))
+
+    def test_pdf_without_native_text_reports_model_download_failure(self):
+        source_file = self.folder / "scanned.pdf"
+        source_file.touch()
+        self.converter.convert.side_effect = LocalEntryNotFoundError("Model not cached")
+        page = Mock()
+        page.get_textpage.return_value.get_text_bounded.return_value = ""
+        with patch("pypdfium2.PdfDocument") as pdf_document:
+            pdf_document.return_value.__enter__.return_value = [page]
+            with self.assertRaisesRegex(ValueError, "no extractable text"):
+                load_source_with_docling(source_file)
+
+    def test_pdf_does_not_fallback_for_unrelated_docling_errors(self):
+        source_file = self.folder / "input.pdf"
+        source_file.touch()
+        self.converter.convert.side_effect = RuntimeError("Unexpected conversion error")
+        with self.assertRaisesRegex(RuntimeError, "Unexpected conversion error"):
+            load_source_with_docling(source_file)
+
+    def test_source_coverage_restores_original_bullet_boundaries(self):
+        resume = CoforgeResumeSchema.model_validate(self.data)
+        resume.profile_summary = ["First summary point", "continues on a wrapped line.", "Second point."]
+        resume.projects[0].responsibilities = ["First responsibility", "continues here.", "Second responsibility."]
+        source = SourceDocument(
+            "",
+            [],
+            "Professional Summary\n• First summary point continues on a wrapped line.\n• Second point.\n"
+            "Project: Project 3\nResponsibilities\n- First responsibility continues here.\n"
+            "- Second responsibility.\n",
+        )
+        self.assertEqual(source_coverage(resume, source, repair=True), [])
+        self.assertEqual(resume.profile_summary, ["First summary point continues on a wrapped line.", "Second point."])
+        self.assertEqual(resume.projects[0].responsibilities,
+                         ["First responsibility continues here.", "Second responsibility."])
+
     @patch("resume_automation.extraction.call_coforge_ai_studio")
     def test_all_eight_word_overviews_from_original_cells(self, gateway):
-        source_file = next((MASTER.parent.parent / "Inputs").glob("5_Prashant*.docx"))
-        tables = Document(source_file).tables[1:]
-        self.assertEqual(len(tables), 8)
-        projects, expected = [], []
-        for table in reversed(tables):
-            header = table.rows[0].cells
-            projects.append(dict(self.data["projects"][0],
-                                 organization_name=header[0].text.split(":", 1)[1].strip(),
-                                 duration=header[-1].text.split(":", 1)[1].strip(),
-                                 role=table.rows[3].cells[-1].text.strip(), description="",
-                                 project_title="Banking Operations Workflow Initiatives", descriptive_title=True))
-            expected.append(" ".join(table.rows[4].cells[-1].text.split()))
-        self.data["projects"] = projects
+        source_file = self.folder / "eight-projects.docx"
+        source_doc = Document()
+        table = source_doc.add_table(rows=1, cols=6)
+        for cell, label in zip(table.rows[0].cells, (
+                "Project Description", "Client", "Project", "Role", "Duration", "Responsibilities")):
+            cell.text = label
+        for number in range(1, 9):
+            cells = table.add_row().cells
+            cells[0].text = f"Overview for Org {number}."
+            cells[1].text = f"Org {number}"
+            cells[2].text = f"Project {number}"
+            cells[3].text = "Engineer"
+            cells[4].text = f"January 202{number % 10}"
+            cells[5].text = f"Delivered duty {number}."
+        source_doc.save(source_file)
+        self.data["projects"] = [
+            dict(self.data["projects"][0], organization_name=f"Org {number}",
+                 project_title=f"Portfolio {number}", descriptive_title=True, role="Engineer",
+                 duration=f"January 202{number % 10}", description="",
+                 responsibilities=[f"Delivered duty {number}."])
+            for number in range(8, 0, -1)
+        ]
+        expected = [f"Overview for Org {number}." for number in range(8, 0, -1)]
         gateway.return_value = router_json(self.data)
         self.conversion.document.export_to_markdown.return_value = "Tables lost during conversion"
         data = extract_source(load_source_with_docling(source_file))
@@ -398,7 +485,7 @@ class PipelineTests(unittest.TestCase):
         extractor = Mock(return_value=self.data)
         graph = build_graph(template_path=MASTER, output_dir=self.folder, extractor=extractor)
         status = process(graph, self.source, True)
-        key = sha256(b"coforge-v4\0" + self.source.read_bytes()).hexdigest()
+        key = sha256(b"coforge-v6\0" + self.source.read_bytes()).hexdigest()
         config = {"configurable": {"thread_id": key}}
         graph.update_state(config, {"overviews_checked": False}, as_node="generate")
         self.assertEqual(process(graph, self.source, True), status)

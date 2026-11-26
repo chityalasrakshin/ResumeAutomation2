@@ -4,8 +4,16 @@
 __pycache__/
 *.pyc
 .pytest_cache/
-output/
-output_verify/
-output_test/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+coverage.xml
 *.sqlite
+local_data/
+artifacts/
+Inputs/
+output/
+~$*
 

@@ -11,6 +11,34 @@ def normalized(value):
     return " ".join(value.replace("**", "").split()).casefold()
 
 
+def compact(value: str) -> str:
+    return "".join(char for char in normalized(value) if char.isalnum())
+
+
+def regroup_wrapped_items(items: list[str], expected: list[str]) -> list[str]:
+    """Rejoin model fragments at explicit source-bullet boundaries."""
+    if not expected or len(items) <= len(expected):
+        return items
+    grouped = []
+    index = 0
+    for source_item in expected:
+        target = compact(source_item)
+        pieces = []
+        while index < len(items):
+            pieces.append(items[index].strip())
+            candidate = compact(" ".join(pieces))
+            if candidate == target:
+                grouped.append(" ".join(pieces).strip())
+                index += 1
+                break
+            if not target.startswith(candidate) or len(candidate) >= len(target):
+                return items
+            index += 1
+        else:
+            return items
+    return grouped if index == len(items) else items
+
+
 def listed_items(text, heading):
     """Read explicit list items under a heading, stopping at the next section."""
     active = False
@@ -41,8 +69,11 @@ def source_coverage(data, source, *, repair=False):
     issues = []
     def compare_items(label, items, expected):
         expected = list(expected)
+        if repair:
+            items[:] = regroup_wrapped_items(items, expected)
+        combined = " ".join(items)
         for index, value in enumerate(expected):
-            if normalized(value) in normalized(" ".join(items)):
+            if normalized(value) in normalized(combined) or compact(value) in compact(combined):
                 continue
             if repair:
                 # Insert before the next retained source bullet, preserving the
@@ -50,6 +81,7 @@ def source_coverage(data, source, *, repair=False):
                 later = {normalized(v) for v in expected[index + 1:]}
                 position = next((i for i, v in enumerate(items) if normalized(v) in later), len(items))
                 items.insert(position, value)
+                combined = " ".join(items)
             else:
                 issues.append(f"Missing {label} from source: {value!r}.")
 
@@ -72,7 +104,11 @@ def source_coverage(data, source, *, repair=False):
                       for v in items if normalized(v) not in present)
 
     records = overview_records(data.projects, source)
-    for i, (project, record, block) in enumerate(zip(data.projects, records, project_blocks(data.projects, source.text)), 1):
+    text_blocks = list(project_blocks(data.projects, source.text))
+    pdf_blocks = list(project_blocks(data.projects, source.pdf_text))
+    for i, (project, record, text_block, pdf_block) in enumerate(
+            zip(data.projects, records, text_blocks, pdf_blocks), 1):
+        block = text_block or pdf_block
         if record and record.overview and normalized(project.description) != normalized(record.overview):
             if repair:
                 project.description = record.overview

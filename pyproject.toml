@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "resume-automation"
+version = "0.1.0"
+description = "Convert resumes into structured Coforge Word documents"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "docling>=2.70,<3",
+    "pypdfium2>=4.30,<6",
+    "pydantic>=2.8,<3",
+    "python-docx>=1.2,<2",
+    "langgraph>=1,<2",
+    "langgraph-checkpoint-sqlite>=3,<4",
+    "uuid-utils==0.14.0; platform_system == 'Windows'",
+    "requests>=2.31,<3",
+    "python-dotenv>=1,<2",
+    "langchain-core>=1,<2",
+]
+
+[project.scripts]
+resume-automation = "resume_automation.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["resume_automation*"]

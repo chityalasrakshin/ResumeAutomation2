@@ -9,7 +9,7 @@ from threading import Lock
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command
 
-from .paths import INPUT_DIR, MASTER_TEMPLATE, OUTPUT_DIR
+from .paths import INPUT_DIR, LEGACY_INPUT_DIR, MASTER_TEMPLATE, OUTPUT_DIR, resolve_input_path
 from .extraction import load_source_with_docling
 from .coverage import source_coverage
 from .pipeline import build_graph, verify
@@ -17,6 +17,7 @@ from .schema import CoforgeResumeSchema
 
 
 def discover(folder):
+    folder = resolve_input_path(folder)
     extensions = {".pdf", ".docx", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
     if folder.is_file():
         if folder.name.startswith("~$") or folder.suffix.lower() not in extensions:
@@ -24,17 +25,32 @@ def discover(folder):
         return [folder]
     if not folder.is_dir():
         raise ValueError(f"Input file or directory does not exist: {folder}")
-    return sorted(p for p in folder.iterdir() if p.is_file() and not p.name.startswith("~$")
-                  and p.suffix.lower() in extensions)
+    folders = [folder]
+    if folder.resolve() == LEGACY_INPUT_DIR.resolve() and INPUT_DIR.is_dir():
+        folders.insert(0, INPUT_DIR)
+    elif folder.resolve() == INPUT_DIR.resolve() and LEGACY_INPUT_DIR.is_dir():
+        folders.append(LEGACY_INPUT_DIR)
+    return sorted(
+        p for source in folders for p in source.iterdir()
+        if p.is_file() and not p.name.startswith("~$") and p.suffix.lower() in extensions
+    )
 
 
 # Identical files in concurrent batch slots share one checkpoint and output.
 _thread_locks = [Lock() for _ in range(64)]
 
 
+def _source_digest(path: Path) -> str:
+    digest = sha256(b"coforge-v6\0")
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def process(graph, path, approve_all=False):
     # Regenerate with the current extraction and layout after the format upgrade.
-    digest = sha256(b"coforge-v4\0" + path.read_bytes()).hexdigest()
+    digest = _source_digest(path)
     with _thread_locks[int(digest[:2], 16) % len(_thread_locks)]:
         return _process_thread(graph, path, approve_all, digest)
 
@@ -95,7 +111,8 @@ def run_bulk_batch(graph, folder, workers, approve_all=False):
 
 def main():
     parser = argparse.ArgumentParser(description="Generate or review Coforge resumes")
-    parser.add_argument("--inputs", type=Path, default=INPUT_DIR, help="Resume file or directory (default: Inputs)")
+    parser.add_argument("--inputs", type=Path, default=INPUT_DIR,
+                        help="Resume file or directory (default: local_data/incoming)")
     parser.add_argument("--template", type=Path, default=MASTER_TEMPLATE)
     parser.add_argument("--output", type=Path, default=OUTPUT_DIR)
     parser.add_argument("--workers", type=int, default=3)

@@ -1,4 +1,4 @@
-"""Run the internal Coforge resume batch from a project checkout."""
+"""Compatibility launcher for the resume-automation package CLI."""
 
 from resume_automation.cli import main
 
